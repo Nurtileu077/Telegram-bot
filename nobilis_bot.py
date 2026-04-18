@@ -507,6 +507,11 @@ async def create_bitrix_lead(user_id: int, username: str, session: dict):
             f"📞 Телефон: {phone or '—'}\n"
             f"🔗 Источник поста: {utm}"
         )
+        # Очищаем страну от эмодзи флагов — Битрикс их не принимает в полях
+        import re
+        def clean(val: str) -> str:
+            return re.sub(r'[\U0001F1E0-\U0001F1FF\U0001F300-\U0001FFFF]', '', val or '').strip()
+
         fields = {
             "TITLE":                    f"Telegram: @{name}",
             "NAME":                     name,
@@ -514,10 +519,10 @@ async def create_bitrix_lead(user_id: int, username: str, session: dict):
             "SOURCE_DESCRIPTION":       "Telegram бот Nobilis",
             "COMMENTS":                 comment,
             "STATUS_ID":                "NEW",
-            "UF_CRM_NOBILIS_COUNTRY":   session.get('country', ''),
-            "UF_CRM_NOBILIS_DEGREE":    session.get('degree', ''),
-            "UF_CRM_NOBILIS_FIELD":     session.get('field', ''),
-            "UF_CRM_NOBILIS_BUDGET":    session.get('budget', ''),
+            "UF_CRM_NOBILIS_COUNTRY":   clean(session.get('country', '')),
+            "UF_CRM_NOBILIS_DEGREE":    clean(session.get('degree', '')),
+            "UF_CRM_NOBILIS_FIELD":     clean(session.get('field', '')),
+            "UF_CRM_NOBILIS_BUDGET":    clean(session.get('budget', '')),
             "UF_CRM_NOBILIS_UTM":       utm,
         }
         if phone:

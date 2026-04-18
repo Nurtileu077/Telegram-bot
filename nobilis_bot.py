@@ -322,13 +322,25 @@ SYSTEM_PROMPTS = {
 Никаких общих слов. Только цифры и выводы. 200-260 слов.""" + FORMATTING_RULES,
 }
 
-def generate_post(rubric: str, topic: str) -> str:
-    cta = random.choice(RUBRIC_CTA[rubric])
-    system = SYSTEM_PROMPTS.get(rubric, SYSTEM_PROMPTS["📰 Новости"])
-    system += f"\n\nВ конце поста добавь эту строку:\n👉 {cta}"
+def make_utm(topic: str) -> str:
+    """Создаёт UTM параметр из темы поста для ссылки в боте."""
+    import re
+    slug = re.sub(r'[^a-zA-Zа-яА-Я0-9\s]', '', topic)[:40].strip().replace(' ', '_').lower()
+    return slug
 
-    # Для новостей и статистики — ищем реальные данные
-    use_search = rubric in ["📰 Новости", "📊 Статистика"]
+def generate_post(rubric: str, topic: str) -> str:
+    utm   = make_utm(topic)
+    cta   = random.choice(RUBRIC_CTA[rubric])
+    # Заменяем @nobilissbot на ссылку с UTM
+    cta_with_utm = cta.replace(
+        "→ @nobilissbot",
+        f"→ <a href='https://t.me/nobilissbot?start={utm}'>@nobilissbot</a>"
+    )
+
+    system = SYSTEM_PROMPTS.get(rubric, SYSTEM_PROMPTS["📰 Новости"])
+    system += f"\n\nВ конце поста добавь эту строку:\n👉 {cta_with_utm}"
+
+    use_search = rubric in ["📰 Новости", "📊 Цифры дня"]
     kwargs = dict(
         model="claude-opus-4-5",
         max_tokens=1200,
@@ -458,10 +470,32 @@ def setup_schedule(app: Application):
 # БИТРИКС24 — создание лида
 # ─────────────────────────────────────────────────────────────────
 
+async def setup_bitrix_fields():
+    """Создаёт кастомные поля в Битрикс если их нет."""
+    fields_to_create = [
+        {"FIELD_NAME": "UF_CRM_NOBILIS_COUNTRY",   "EDIT_FORM_LABEL": "Страна",       "LIST_COLUMN_LABEL": "Страна",       "USER_TYPE_ID": "string"},
+        {"FIELD_NAME": "UF_CRM_NOBILIS_DEGREE",    "EDIT_FORM_LABEL": "Уровень",      "LIST_COLUMN_LABEL": "Уровень",      "USER_TYPE_ID": "string"},
+        {"FIELD_NAME": "UF_CRM_NOBILIS_FIELD",     "EDIT_FORM_LABEL": "Направление",  "LIST_COLUMN_LABEL": "Направление",  "USER_TYPE_ID": "string"},
+        {"FIELD_NAME": "UF_CRM_NOBILIS_BUDGET",    "EDIT_FORM_LABEL": "Бюджет",       "LIST_COLUMN_LABEL": "Бюджет",       "USER_TYPE_ID": "string"},
+        {"FIELD_NAME": "UF_CRM_NOBILIS_UTM",       "EDIT_FORM_LABEL": "Источник поста","LIST_COLUMN_LABEL": "Источник поста","USER_TYPE_ID": "string"},
+    ]
+    try:
+        async with httpx.AsyncClient() as client:
+            for f in fields_to_create:
+                await client.post(
+                    f"{BITRIX_WEBHOOK}crm.lead.userfield.add.json",
+                    json={"fields": {**f, "ENTITY_ID": "CRM_LEAD", "MANDATORY": "N", "SHOW_FILTER": "Y"}},
+                    timeout=10
+                )
+        log.info("✅ Bitrix fields ready")
+    except Exception as e:
+        log.error(f"Bitrix field setup error: {e}")
+
 async def create_bitrix_lead(user_id: int, username: str, session: dict):
     try:
-        name  = username or f"TG_{user_id}"
-        phone = session.get('phone', '')
+        name   = username or f"TG_{user_id}"
+        phone  = session.get('phone', '')
+        utm    = session.get('utm_source', 'direct')
         comment = (
             f"📱 Источник: Telegram бот @nobilissbot\n"
             f"👤 Telegram: @{username or user_id}\n"
@@ -470,15 +504,21 @@ async def create_bitrix_lead(user_id: int, username: str, session: dict):
             f"🎓 Уровень: {session.get('degree', '—')}\n"
             f"📚 Направление: {session.get('field', '—')}\n"
             f"💰 Бюджет: {session.get('budget', '—')}\n"
-            f"📞 Телефон: {phone or '—'}"
+            f"📞 Телефон: {phone or '—'}\n"
+            f"🔗 Источник поста: {utm}"
         )
         fields = {
-            "TITLE":              f"Telegram: @{name}",
-            "NAME":               name,
-            "SOURCE_ID":          "WEB",
-            "SOURCE_DESCRIPTION": "Telegram бот Nobilis",
-            "COMMENTS":           comment,
-            "STATUS_ID":          "NEW",
+            "TITLE":                    f"Telegram: @{name}",
+            "NAME":                     name,
+            "SOURCE_ID":                "WEB",
+            "SOURCE_DESCRIPTION":       "Telegram бот Nobilis",
+            "COMMENTS":                 comment,
+            "STATUS_ID":                "NEW",
+            "UF_CRM_NOBILIS_COUNTRY":   session.get('country', ''),
+            "UF_CRM_NOBILIS_DEGREE":    session.get('degree', ''),
+            "UF_CRM_NOBILIS_FIELD":     session.get('field', ''),
+            "UF_CRM_NOBILIS_BUDGET":    session.get('budget', ''),
+            "UF_CRM_NOBILIS_UTM":       utm,
         }
         if phone:
             fields["PHONE"] = [{"VALUE": phone, "VALUE_TYPE": "MOBILE"}]
@@ -540,15 +580,23 @@ async def notify_manager(user_id, username, session, ctx):
         f"👤 @{username or user_id} (id: {user_id})\n"
         f"📞 <b>{phone}</b>\n\n"
         f"🌍 {session.get('country')}  |  🎓 {session.get('degree')}\n"
-        f"📚 {session.get('field')}  |  💰 {session.get('budget')}\n\n"
+        f"📚 {session.get('field')}  |  💰 {session.get('budget')}\n"
+        f"🔗 Пришёл с поста: <i>{session.get('utm_source', 'direct')}</i>\n\n"
         f"✅ Лид создан в Битрикс24\n"
         f"<a href='tg://user?id={user_id}'>💬 Написать клиенту</a>"
     )
     await ctx.bot.send_message(chat_id=MANAGER_ID, text=msg, parse_mode="HTML")
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    user_sessions[uid] = {"step": 0}
+    uid  = update.effective_user.id
+    args = ctx.args  # берём UTM из /start utm_source
+
+    source = "direct"
+    if args:
+        # /start lse_warwick_finance → источник поста
+        source = " ".join(args).replace("_", " ")
+
+    user_sessions[uid] = {"step": 0, "utm_source": source}
     await send_question(uid, 0, ctx)
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -706,7 +754,8 @@ def main():
 
     async def on_startup(a):
         setup_schedule(a)
-        log.info("🚀 Nobilis Bot v3 started — Bitrix24 + Photos enabled")
+        await setup_bitrix_fields()
+        log.info("🚀 Nobilis Bot v3 started — Bitrix24 + Photos + UTM enabled")
 
     app.post_init = on_startup
     app.run_polling(allowed_updates=Update.ALL_TYPES)

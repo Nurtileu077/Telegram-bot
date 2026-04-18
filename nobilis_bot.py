@@ -464,6 +464,7 @@ def setup_schedule(app: Application):
 async def create_bitrix_lead(user_id: int, username: str, session: dict):
     try:
         name = username or f"TG_{user_id}"
+        phone = session.get('phone', '')
         comment = (
             f"Источник: Telegram бот @nobilissbot\n"
             f"Telegram: @{username or user_id}\n"
@@ -471,7 +472,8 @@ async def create_bitrix_lead(user_id: int, username: str, session: dict):
             f"Страна: {session.get('country', '—')}\n"
             f"Уровень: {session.get('degree', '—')}\n"
             f"Направление: {session.get('field', '—')}\n"
-            f"Бюджет: {session.get('budget', '—')}"
+            f"Бюджет: {session.get('budget', '—')}\n"
+            f"Телефон: {phone or '—'}"
         )
         params = {
             "fields[TITLE]":              f"Telegram: @{name}",
@@ -481,6 +483,10 @@ async def create_bitrix_lead(user_id: int, username: str, session: dict):
             "fields[COMMENTS]":           comment,
             "fields[STATUS_ID]":          "NEW",
         }
+        if phone:
+            params["fields[PHONE][0][VALUE]"]      = phone
+            params["fields[PHONE][0][VALUE_TYPE]"] = "MOBILE"
+
         async with httpx.AsyncClient() as client:
             r = await client.get(
                 f"{BITRIX_WEBHOOK}crm.lead.add",
@@ -520,6 +526,9 @@ QUESTIONS = [
      [["До $10K", "$10K–$25K", "$25K–$50K", "$50K+"]]),
 ]
 
+# Последний вопрос — телефон (текстом, не кнопками)
+PHONE_QUESTION = "📞 Оставьте номер телефона — наш консультант свяжется с вами в течение рабочего дня:\n\n<i>Например: +7 777 123 45 67</i>"
+
 async def send_question(chat_id: int, step: int, ctx: ContextTypes.DEFAULT_TYPE):
     key, text, rows = QUESTIONS[step]
     kb = [[InlineKeyboardButton(o, callback_data=f"q:{step}:{o}") for o in row] for row in rows]
@@ -529,9 +538,11 @@ async def send_question(chat_id: int, step: int, ctx: ContextTypes.DEFAULT_TYPE)
 async def notify_manager(user_id, username, session, ctx):
     if not MANAGER_ID:
         return
+    phone = session.get('phone', 'не указан')
     msg = (
         f"🔥 <b>Новый лид из Telegram!</b>\n"
-        f"👤 @{username or user_id} (id: {user_id})\n\n"
+        f"👤 @{username or user_id} (id: {user_id})\n"
+        f"📞 <b>{phone}</b>\n\n"
         f"🌍 {session.get('country')}  |  🎓 {session.get('degree')}\n"
         f"📚 {session.get('field')}  |  💰 {session.get('budget')}\n\n"
         f"✅ Лид создан в Битрикс24\n"
@@ -567,13 +578,12 @@ async def cmd_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     msg = await update.message.reply_text("⏳ Генерирую пост...")
     try:
-        weekday = datetime.now().weekday()
-        hour    = datetime.now().hour
-        slot    = 0 if hour < 11 else (1 if hour < 16 else 2)
-        rubric  = DAILY_SCHEDULE[weekday][slot]
-        topic   = pick_topic(rubric)
-        photo   = random.choice(RUBRIC_PHOTOS[rubric])
-        text    = generate_post(rubric, topic)
+        # Берём случайную рубрику — не повторяем последнюю использованную
+        all_rubrics = list(RUBRICS.keys())
+        rubric = random.choice(all_rubrics)
+        topic  = pick_topic(rubric)
+        photo  = random.choice(RUBRIC_PHOTOS[rubric])
+        text   = generate_post(rubric, topic)
         try:
             await ctx.bot.send_photo(
                 chat_id=CHANNEL_ID, photo=photo,
@@ -647,39 +657,52 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         user_sessions[uid]["step"] = nxt
         await send_question(uid, nxt, ctx)
     else:
-        s = user_sessions[uid]
+        # Анкета заполнена — спрашиваем телефон
+        user_sessions[uid]["step"] = "phone"
         await ctx.bot.send_message(
             chat_id=uid,
-            text=(
-                f"✅ <b>Принято!</b>\n\n"
-                f"🌍 {s.get('country')}  •  🎓 {s.get('degree')}\n"
-                f"📚 {s.get('field')}  •  💰 {s.get('budget')}\n\n"
-                "Наш консультант подготовит список университетов "
-                "и напишет вам в течение рабочего дня. 🙌"
-            ),
+            text=PHONE_QUESTION,
             parse_mode="HTML"
-        )
-        # Отправляем в Битрикс и менеджеру параллельно
-        await asyncio.gather(
-            create_bitrix_lead(uid, q.from_user.username or "", s),
-            notify_manager(uid, q.from_user.username or "", s, ctx)
         )
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
+    uid = u.id
     text = update.message.text
+
+    # Ловим номер телефона если ждём его
+    if uid in user_sessions and user_sessions[uid].get("step") == "phone":
+        user_sessions[uid]["phone"] = text
+        user_sessions[uid]["step"] = "done"
+        s = user_sessions[uid]
+
+        await update.message.reply_text(
+            f"✅ <b>Отлично, всё записали!</b>\n\n"
+            f"🌍 {s.get('country')}  •  🎓 {s.get('degree')}\n"
+            f"📚 {s.get('field')}  •  💰 {s.get('budget')}\n"
+            f"📞 {s.get('phone')}\n\n"
+            "Наш консультант свяжется с вами в течение рабочего дня. 🙌",
+            parse_mode="HTML"
+        )
+        await asyncio.gather(
+            create_bitrix_lead(uid, u.username or "", s),
+            notify_manager(uid, u.username or "", s, ctx)
+        )
+        return
+
+    # Обычное сообщение — пересылаем менеджеру
     await update.message.reply_text(
         "📨 Получили! Консультант ответит в течение рабочего дня.\n\n"
-        "Для быстрого подбора программы — /start"
+        "Чтобы оставить заявку — /start"
     )
     if MANAGER_ID:
         await ctx.bot.send_message(
             chat_id=MANAGER_ID,
             text=(
                 f"💬 <b>Новое сообщение</b>\n"
-                f"👤 @{u.username or u.id} (id: {u.id})\n\n"
+                f"👤 @{u.username or uid} (id: {uid})\n\n"
                 f"<i>{text}</i>\n\n"
-                f"<a href='tg://user?id={u.id}'>Ответить</a>"
+                f"<a href='tg://user?id={uid}'>Ответить</a>"
             ),
             parse_mode="HTML"
         )

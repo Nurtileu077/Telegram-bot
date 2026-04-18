@@ -382,7 +382,22 @@ def search_breaking_news() -> str | None:
 # ПУБЛИКАЦИЯ С ФОТО
 # ─────────────────────────────────────────────────────────────────
 
-_publishing = False  # блокировка от дублей
+_publishing = False
+
+async def send_post_to_channel(bot, text: str, photo: str):
+    """Отправляет фото + текст двумя отдельными сообщениями."""
+    # Сначала фото без подписи
+    try:
+        await bot.send_photo(chat_id=CHANNEL_ID, photo=photo)
+    except Exception as e:
+        log.warning(f"Photo failed, skipping: {e}")
+    # Потом полный текст отдельным сообщением
+    await bot.send_message(
+        chat_id=CHANNEL_ID,
+        text=text,
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
 
 async def publish(app: Application, slot: int):
     global _publishing
@@ -390,28 +405,15 @@ async def publish(app: Application, slot: int):
         log.warning("Already publishing, skipping duplicate")
         return
     _publishing = True
-    text = ""
     try:
-        weekday  = datetime.now().weekday()
-        rubric   = DAILY_SCHEDULE[weekday][slot]
-        topic    = pick_topic(rubric)
-        photo    = random.choice(RUBRIC_PHOTOS[rubric])
+        weekday = datetime.now().weekday()
+        rubric  = DAILY_SCHEDULE[weekday][slot]
+        topic   = pick_topic(rubric)
+        photo   = random.choice(RUBRIC_PHOTOS[rubric])
 
         log.info(f"Generating [{rubric}] — {topic}")
         text = generate_post(rubric, topic)
-
-        try:
-            await app.bot.send_photo(
-                chat_id=CHANNEL_ID,
-                photo=photo,
-                caption=text,
-                parse_mode="HTML"
-            )
-        except Exception:
-            await app.bot.send_message(
-                chat_id=CHANNEL_ID, text=text,
-                parse_mode="HTML", disable_web_page_preview=True
-            )
+        await send_post_to_channel(app.bot, text, photo)
         log.info("✅ Published")
     except Exception as e:
         log.error(f"Publish error: {e}")
@@ -425,16 +427,11 @@ async def check_and_publish_breaking(app: Application):
         text = search_breaking_news()
         if text:
             photo = random.choice(RUBRIC_PHOTOS["📰 Новости"])
-            try:
-                await app.bot.send_photo(
-                    chat_id=CHANNEL_ID, photo=photo,
-                    caption=f"🔴 <b>Срочно</b>\n\n{text}", parse_mode="HTML"
-                )
-            except:
-                await app.bot.send_message(
-                    chat_id=CHANNEL_ID,
-                    text=f"🔴 <b>Срочно</b>\n\n{text}", parse_mode="HTML"
-                )
+            await send_post_to_channel(
+                app.bot,
+                f"🔴 <b>Срочно</b>\n\n{text}",
+                photo
+            )
             log.info("✅ Breaking news published")
         else:
             log.info("No breaking news")
@@ -463,34 +460,33 @@ def setup_schedule(app: Application):
 
 async def create_bitrix_lead(user_id: int, username: str, session: dict):
     try:
-        name = username or f"TG_{user_id}"
+        name  = username or f"TG_{user_id}"
         phone = session.get('phone', '')
         comment = (
-            f"Источник: Telegram бот @nobilissbot\n"
-            f"Telegram: @{username or user_id}\n"
-            f"ID: {user_id}\n\n"
-            f"Страна: {session.get('country', '—')}\n"
-            f"Уровень: {session.get('degree', '—')}\n"
-            f"Направление: {session.get('field', '—')}\n"
-            f"Бюджет: {session.get('budget', '—')}\n"
-            f"Телефон: {phone or '—'}"
+            f"📱 Источник: Telegram бот @nobilissbot\n"
+            f"👤 Telegram: @{username or user_id}\n"
+            f"🆔 ID: {user_id}\n\n"
+            f"🌍 Страна: {session.get('country', '—')}\n"
+            f"🎓 Уровень: {session.get('degree', '—')}\n"
+            f"📚 Направление: {session.get('field', '—')}\n"
+            f"💰 Бюджет: {session.get('budget', '—')}\n"
+            f"📞 Телефон: {phone or '—'}"
         )
-        params = {
-            "fields[TITLE]":              f"Telegram: @{name}",
-            "fields[NAME]":               name,
-            "fields[SOURCE_ID]":          "WEB",
-            "fields[SOURCE_DESCRIPTION]": "Telegram бот Nobilis",
-            "fields[COMMENTS]":           comment,
-            "fields[STATUS_ID]":          "NEW",
+        fields = {
+            "TITLE":              f"Telegram: @{name}",
+            "NAME":               name,
+            "SOURCE_ID":          "WEB",
+            "SOURCE_DESCRIPTION": "Telegram бот Nobilis",
+            "COMMENTS":           comment,
+            "STATUS_ID":          "NEW",
         }
         if phone:
-            params["fields[PHONE][0][VALUE]"]      = phone
-            params["fields[PHONE][0][VALUE_TYPE]"] = "MOBILE"
+            fields["PHONE"] = [{"VALUE": phone, "VALUE_TYPE": "MOBILE"}]
 
         async with httpx.AsyncClient() as client:
-            r = await client.get(
-                f"{BITRIX_WEBHOOK}crm.lead.add",
-                params=params,
+            r = await client.post(
+                f"{BITRIX_WEBHOOK}crm.lead.add.json",
+                json={"fields": fields},
                 timeout=10
             )
             data = r.json()
@@ -584,15 +580,7 @@ async def cmd_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         topic  = pick_topic(rubric)
         photo  = random.choice(RUBRIC_PHOTOS[rubric])
         text   = generate_post(rubric, topic)
-        try:
-            await ctx.bot.send_photo(
-                chat_id=CHANNEL_ID, photo=photo,
-                caption=text, parse_mode="HTML"
-            )
-        except:
-            await ctx.bot.send_message(
-                chat_id=CHANNEL_ID, text=text, parse_mode="HTML"
-            )
+        await send_post_to_channel(ctx.bot, text, photo)
         await msg.edit_text(f"✅ Опубликовано!\nРубрика: {rubric}\nТема: {topic}")
     except Exception as e:
         await msg.edit_text(f"❌ Ошибка: {e}")
@@ -607,16 +595,11 @@ async def cmd_news(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text = search_breaking_news()
         if text:
             photo = random.choice(RUBRIC_PHOTOS["📰 Новости"])
-            try:
-                await ctx.bot.send_photo(
-                    chat_id=CHANNEL_ID, photo=photo,
-                    caption=f"🔴 <b>Срочно</b>\n\n{text}", parse_mode="HTML"
-                )
-            except:
-                await ctx.bot.send_message(
-                    chat_id=CHANNEL_ID,
-                    text=f"🔴 <b>Срочно</b>\n\n{text}", parse_mode="HTML"
-                )
+            await send_post_to_channel(
+                ctx.bot,
+                f"🔴 <b>Срочно</b>\n\n{text}",
+                photo
+            )
             await msg.edit_text("✅ Свежая новость опубликована!")
         else:
             await msg.edit_text("ℹ️ Срочных новостей сейчас нет. Попробуйте позже.")
